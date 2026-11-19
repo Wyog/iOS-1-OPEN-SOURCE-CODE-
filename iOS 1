@@ -1,0 +1,388 @@
+#pragma mark -
+#pragma mark APFS utilities
+//----------------------------
+
+uint16_t
+AppleFileSystemDriver::getAPFSRoleForVolume(IOMedia *media)
+{
+    uint16_t role = APFS_VOL_ROLE_NONE;
+
+    OSNumber *roleNumber = OSDynamicCast(OSNumber, media->getProperty(kAPFSRoleValueKey));
+
+    if (roleNumber != NULL) {
+        role = roleNumber->unsigned16BitValue();
+    }
+
+    return role;
+}
+
+OSString *
+AppleFileSystemDriver::copyAPFSContainerUUIDForVolume(IOMedia *volume)
+{
+    // Find the first kIOMediaUUID among the volume's ancestors. This should
+    // work for any topology leading to APFS_CONTAINER_OBJECT or APFS_MEDIA_OBJECT.
+
+    IORegistryEntry *parent = volume->getParentEntry(gIOServicePlane);
+
+    if (parent == NULL) {
+        return NULL;
+    }
+
+    OSObject *value = parent->copyProperty(kIOMediaUUIDKey, gIOServicePlane);
+
+    if (value == NULL) {
+        return NULL;
+    }
+
+    OSString *result = OSDynamicCast(OSString, value);
+
+    if (result == NULL) {
+        value->release();
+        return NULL;
+    }
+
+    return result;
+}
+
+bool
+AppleFileSystemDriver::volumeMatchesAPFSUUID(IOMedia *media, OSString *uuidString, bool matchAnyRoleInGroup)
+{
+    OSString *uuidProperty = NULL;
+
+    uuidProperty = OSDynamicCast( OSString, media->getProperty(kAPFSVolGroupUUIDKey) );
+
+    if ((uuidProperty != NULL) && uuidProperty->isEqualTo(uuidString)) {
+        // This apfs-preboot-uuid is a volume group.
+
+        uint16_t role = getAPFSRoleForVolume(media);
+
+        VERBOSE_LOG("%s: %s property matched (role = 0x%x)\n", __func__, kAPFSVolGroupUUIDKey, (unsigned int) role);
+
+        return (role == APFS_VOL_ROLE_SYSTEM) || matchAnyRoleInGroup;
+    }
+
+    uuidProperty = OSDynamicCast( OSString, media->getProperty(kIOMediaUUIDKey) );
+
+    if ((uuidProperty != NULL) && uuidProperty->isEqualTo(uuidString)) {
+        // This apfs-preboot-uuid is a plain volume UUID.
+
+        VERBOSE_LOG("%s: %s property matched\n", __func__, kIOMediaUUIDKey);
+
+        return true;
+    }
+
+    return false;
+}
+
+bool
+AppleFileSystemDriver::volumeMatchesAPFSContainerUUID(IOMedia *media, OSString *uuidString)
+{
+    bool result = false;
+
+    OSString *containerUUID = copyAPFSContainerUUIDForVolume(media);
+
+    if (containerUUID != NULL) {
+        result = containerUUID->isEqualTo(uuidString);
+
+        containerUUID->release();
+    }
+
+    return result;
+}
+
+bool
+AppleFileSystemDriver::volumeMatchesAPFSRole(IOMedia *media, uint16_t expectedRole)
+{
+    return expectedRole == getAPFSRoleForVolume(media);
+}
+
+IONotifier *
+AppleFileSystemDriver::startMatchingForAPFSVolumes(IOServiceMatchingNotificationHandler callback)
+{
+    OSDictionary *matching = NULL;
+    IONotifier *notifier = NULL;
+
+    matching = IOService::serviceMatching(APFS_VOLUME_OBJECT);
+
+    if (matching != NULL) {
+        notifier = IOService::addMatchingNotification(gIOMatchedNotification, matching, callback, this, NULL, 0);
+
+        matching->release();
+    }
+
+    return notifier;
+}
+
+#pragma mark -
+#pragma mark associated-volume-group
+
+/*!
+ * Finds the APFS recovery volume in the same container as the requested
+ * volume or volume group UUID. Holds +1 refcount through this series of
+ * callbacks:
+ *
+ *   startWithAPFSUUIDForRecovery() // retained here
+ *   checkAPFSUUIDForRecovery()
+ *   checkAPFSRecoveryVolumeInContainer()
+ *   publishBootMediaAndTerminate() // released here
+ */
+
+bool
+AppleFileSystemDriver::startWithAPFSUUIDForRecovery(OSObject *uuidProperty)
+{
+    IONotifier *startedNotifier = NULL;
+
+    do {
+        if (!OSCompareAndSwap(STATE_IDLE, STATE_MATCHING_APFS_UUID_FOR_RECOVERY, &_state)) break;
+
+        // Start matching APFS volumes with the given UUID, but only to
+        // find the container whose recovery volume we actually want.
+
+        _uuidString = createUUIDStringFromObject(getName(), uuidProperty, _uuid);
+
+        if (_uuidString == NULL) break;
+
+        retain(); // +1 while notification is active
+
+        startedNotifier = startMatchingForAPFSVolumes(
+            OSMemberFunctionCast(IOServiceMatchingNotificationHandler, this, &AppleFileSystemDriver::checkAPFSUUIDForRecovery));
+
+    } while (false);
+
+    return (startedNotifier != NULL);
+}
+
+/*!
+ * Checks if an APFS volume matches the requested UUID. If it does, this latches
+ * the container UUID and starts looking for its peer APFS recovery volume.
+ */
+
+bool
+AppleFileSystemDriver::checkAPFSUUIDForRecovery(void *ref, IOService *service, IONotifier *notifier)
+{
+    IONotifier *chainedNotifier = NULL;
+    IOMedia *media = NULL;
+
+    DEBUG_LOG("%s[%p]::%s -> '%s'\n", getName(), this, __func__, service->getName());
+
+    do {
+        // Skip volumes that don't match our UUID.
+
+        media = OSDynamicCast(IOMedia, service);
+
+        if (media == NULL) break;
+
+        if (!volumeMatchesAPFSUUID(media, _uuidString, /*matchAnyRoleInGroup*/ true)) break;
+
+        // Stop notifications after the first match.
+
+        if (!OSCompareAndSwap(STATE_MATCHING_APFS_UUID_FOR_RECOVERY, STATE_MATCHING_APFS_RECOVERY_IN_CONTAINER, &_state)) break;
+
+        notifier->remove();
+        notifier = NULL;
+
+        // Start looking for APFS recovery volumes in this container.
+
+        if (_containerUUID != NULL) _containerUUID->release(); // should never happen
+
+        _containerUUID = copyAPFSContainerUUIDForVolume(media);
+
+        if (_containerUUID == NULL) break;
+
+        retain(); // +1 while notification is active
+
+        chainedNotifier = startMatchingForAPFSVolumes(
+            OSMemberFunctionCast(IOServiceMatchingNotificationHandler, this, &AppleFileSystemDriver::checkAPFSRecoveryVolumeInContainer));
+
+        if (chainedNotifier == NULL) break;
+
+        VERBOSE_LOG("%s[%p]::%s returning TRUE\n", getName(), this, __func__);
+
+        release(); // -1 for completed notification
+
+        return true;
+
+    } while (false);
+
+    DEBUG_LOG("%s[%p]::%s returning false\n", getName(), this, __func__);
+
+    return false;
+}
+
+/*!
+ * Checks if an APFS volume has the recovery role in the desired container. If it does,
+ * publish the volume and terminates.
+ */
+
+bool
+AppleFileSystemDriver::checkAPFSRecoveryVolumeInContainer(void *ref, IOService *service, IONotifier *notifier)
+{
+    IOMedia *media = NULL;
+
+    DEBUG_LOG("%s[%p]::%s -> '%s'\n", getName(), this, __func__, service->getName());
+
+    do {
+        // Skip volumes that don't match our role or container UUID.
+
+        media = OSDynamicCast(IOMedia, service);
+
+        if (media == NULL) break;
+
+        if (!volumeMatchesAPFSRole(media, APFS_VOL_ROLE_RECOVERY)) break;
+
+        if (!volumeMatchesAPFSContainerUUID(media, _containerUUID)) break;
+
+        // Stop notifications after the first match.
+
+        if (!OSCompareAndSwap(STATE_MATCHING_APFS_RECOVERY_IN_CONTAINER, STATE_PUBLISHED, &_state)) break;
+
+        notifier->remove();
+        notifier = NULL;
+
+        // Publish the matching volume.
+
+        VERBOSE_LOG("%s[%p]::%s returning TRUE\n", getName(), this, __func__);
+
+        return publishBootMediaAndTerminate(media); // calls release() for us
+
+    } while (false);
+
+    DEBUG_LOG("%s[%p]::%s returning false\n", getName(), this, __func__);
+
+    return false;
+}
+
+#pragma mark -
+#pragma mark apfs-preboot-uuid
+
+/*!
+ * Finds the APFS volume or volume group matching the reqeusted UUID. If the UUID
+ * is a volume group, only matches volumes with the system role. Holds +1 refcount
+ * through this series of callbacks:
+ *
+ *   startWithAPFSUUID() // retained here
+ *   checkAPFSUUID()
+ *   publishBootMediaAndTerminate() // released here
+ */
+
+bool
+AppleFileSystemDriver::startWithAPFSUUID(OSObject *uuidProperty)
+{
+    IONotifier *startedNotifier = NULL;
+
+    do {
+        if (!OSCompareAndSwap(STATE_IDLE, STATE_MATCHING_APFS_UUID, &_state)) break;
+
+        // Start matching APFS volumes with the given UUID.
+
+        _uuidString = createUUIDStringFromObject(getName(), uuidProperty, _uuid);
+
+        if (_uuidString == NULL) break;
+
+        retain(); // +1 while notification is active
+
+        startedNotifier = startMatchingForAPFSVolumes(
+            OSMemberFunctionCast(IOServiceMatchingNotificationHandler, this, &AppleFileSystemDriver::checkAPFSUUID));
+
+    } while (false);
+
+    return (startedNotifier != NULL);
+}
+
+/*!
+ * Checks if an APFS volume matches the requested UUID. If it does,
+ * publish the volume and terminates.
+ */
+
+bool
+AppleFileSystemDriver::checkAPFSUUID(void *ref, IOService *service, IONotifier *notifier)
+{
+    IOMedia *media = NULL;
+
+    DEBUG_LOG("%s[%p]::%s -> '%s'\n", getName(), this, __func__, service->getName());
+
+    do {
+        // Skip volumes that do not match our UUID.
+
+        media = OSDynamicCast(IOMedia, service);
+
+        if (media == NULL) break;
+
+        if (!volumeMatchesAPFSUUID(media, _uuidString)) break;
+
+        // Stop notifications after first match.
+
+        if (!OSCompareAndSwap(STATE_MATCHING_APFS_UUID, STATE_PUBLISHED, &_state)) break;
+
+        notifier->remove();
+        notifier = NULL;
+
+        // Publish the matching volume.
+
+        VERBOSE_LOG("%s[%p]::%s returning TRUE\n", getName(), this, __func__);
+
+        return publishBootMediaAndTerminate(media); // calls release() for us
+
+    } while (false);
+
+    DEBUG_LOG("%s[%p]::%s returning false\n", getName(), this, __func__);
+
+    return false;
+}
+
+#pragma mark -
+#pragma mark boot-uuid
+
+/*!
+ * Check if an IOMedia or its filesystem match the requested UUID. If it
+ * does, publish the volume and terminate. This will reach inside HFS
+ * volumes to compute the volume UUID as hfs.util would.
+ */
+
+bool
+AppleFileSystemDriver::checkBootUUID(void *ref, IOService * service, IONotifier * notifier)
+{
+    IOMedia *       media;
+    IOReturn        status      = kIOReturnError;
+    OSString *      contentHint;
+    const char *    contentStr;
+    VolumeUUID      volumeUUID;
+    OSString *      uuidProperty;
+    uuid_t          uuid;
+    bool            matched     = false;
+
+DEBUG_LOG("%s[%p]::%s -> '%s'\n", getName(), this, func, service->getName());
+do {
+media = OSDynamicCast( IOMedia, service );
+if (media == 0) break;
+if ( media->isFormatted() == false ) break;
+// If the media already has a UUID property, try that first.
+uuidProperty = OSDynamicCast( OSString, media->getProperty(kIOMediaUUIDKey) );
+if (uuidProperty != NULL) {
+if (_uuidString && uuidProperty->isEqualTo(_uuidString)) {
+VERBOSE_LOG("existing UUID property matched\n");
+matched = true;
+break;
+}
+}
+// only IOMedia's with content hints are interesting
+contentHint = OSDynamicCast( OSString, media->getProperty(kIOMediaContentHintKey) );
+if (contentHint == NULL) break;
+contentStr = contentHint->getCStringNoCopy();
+if (contentStr == NULL) break;
+// Probe based on content hint (HFS, HFSX, Boot, Recovery, or corresponding UUID strings) to read the HFS UUID, or log and break otherwise.
+if ( strcmp(contentStr, "Apple_HFS") == 0 ||
+strcmp(contentStr, "Apple_HFSX") == 0 ||
+strcmp(contentStr, "Apple_Boot") == 0 ||
+strcmp(contentStr, "Apple_Recovery") == 0 ||
+strcmp(contentStr, "48465300-0000-11AA-AA11-00306543ECAC") == 0 ||
+strcmp(contentStr, "426F6F74-0000-11AA-AA11-00306543ECAC") == 0 ||
+strcmp(contentStr, "5265636F-7665-11AA-AA11-00306543ECAC") == 0 ) {
+status = readHFSUUID( media, (void **)&volumeUUID );
+} else {
+DEBUG_LOG("contentStr %s\n", contentStr);
+break;
+}
+} while (false);
+return matched;
+}
